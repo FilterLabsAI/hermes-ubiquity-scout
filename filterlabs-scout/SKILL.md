@@ -49,33 +49,66 @@ Request: POST https://scout.ubiquity.filterlabs.ai/api/v1/search
   Headers: Authorization: Bearer <access_token>, Content-Type: application/json
   Body: {"max_results": <int, required>, "topics": ["..."], "keywords": ["..."] (optional)}
 
-Response: {request_id, content (raw LLM narration — ignore, parse `results`
-instead), results: [{title,url,source,language,published_at,snippet}, ...],
-queries_used (internal expanded queries Scout actually ran), usage}
+Response: {request_id, content (raw LLM narration), results:
+[{title,url,source,language,published_at,snippet}, ...], queries_used
+(internal expanded queries Scout actually ran), usage}
 
-CLI (auto-handles token fetch/refresh):
+### Foreground (small requests, max_results <~30)
   python3 scripts/scout_search.py --topics "topic one" "topic two" \
       --keywords kw1 kw2 --max-results 10
   python3 scripts/scout_search.py --topics "topic" --max-results 10 --json   # raw JSON
 
-Library usage:
+Timeout auto-scales with max_results (min 600s, +5s per requested
+result) — no need to pass --timeout manually unless overriding. Even a
+small request (e.g. max_results=30) has taken ~9 minutes end-to-end in
+practice, so the floor is intentionally generous.
+
+### Background (long-running requests — USE THIS for max_results >= 50,
+or whenever you'd otherwise block a shell/terminal call waiting)
+  # Launch: returns immediately with a PID and files to poll
+  python3 scripts/scout_search.py --topics "topic" --max-results 300 \
+      --out /tmp/scout_run.json --background
+
+  # Poll (repeat until status is done/error; safe to call anytime)
+  python3 scripts/scout_search.py --status /tmp/scout_run.json
+  # -> "status: running" | "status: done\nresults: N" | "status: error\nsee log: ..."
+
+When driving this from the agent's own terminal tool, launch with
+--background (returns instantly), then use the terminal tool's own
+background+notify mechanism (or repeated --status polls) rather than
+blocking a single foreground call on a 5-10+ minute Scout request.
+
+### Library usage
   import sys, os
   sys.path.insert(0, os.path.join(SKILL_DIR, "scripts"))
   from scout_search import scout_search
   data = scout_search(topics=["AI safety"], keywords=["alignment"], max_results=5)
   for r in data["results"]:
       print(r["title"], r["url"])
+  # timeout=None (default) auto-scales with max_results; pass an int to override.
 
 ## Usage notes
 - topics is required (non-empty list); keywords is optional.
 - Map the user's core subject(s) to topics, narrower filter terms to
   keywords. Scout expands these into several internal search queries
   (see `queries_used`) — keep topics/keywords short/conceptual, not full
-  sentences.
-- Large max_results (e.g. 50) can take several minutes to generate — run
-  as a background process with a generous timeout (200s+), don't block
-  synchronously waiting on a single foreground call.
-- `content` is free-text LLM narration; always parse `results` for facts,
-  never `content`.
+  sentences. To bias toward social platforms, say so explicitly in the
+  topic/keywords (e.g. topics=["Reddit and Twitter/X reactions to ..."],
+  keywords=["reddit","twitter","X","tweet"]) — Scout does not default to
+  social sources.
+- max_results is a hint/ceiling, NOT a guarantee. Scout has returned far
+  fewer structured results than requested (e.g. asked for 500, got 56)
+  even on a successful HTTP 200. ALWAYS check len(data["results"]) and
+  report the actual count to the user — never assume you got what you
+  asked for. The CLI prints `requested: X  received: Y` and warns on
+  stderr when received < 50% of requested.
+- `content` is free-text LLM narration. Normally ignore it and parse
+  `results`. EXCEPTION: if `results` comes back empty (seen on
+  social/Reddit-heavy queries where Reddit access gets rate-limited
+  server-side), scout_search() automatically tries to salvage a results
+  list out of an embedded ```json block inside `content` and sets
+  `results_salvaged=True` on the returned dict. Treat salvaged results
+  as lower-confidence/approximate (the source narration may itself note
+  reconstruction from partial data) and mention the caveat to the user.
 - 401 errors usually mean the refresh_token itself expired (>8h idle) —
   re-run --login with fresh credentials.

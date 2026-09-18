@@ -8,8 +8,9 @@ description: Use for FilterLabs Scout API. Login, token refresh, search.
 Self-contained skill for FilterLabs/Ubiquity services:
 - Ubiquity (ubiquity.filterlabs.ai) frontend, secured by Keycloak at
   auth.filterlabs.ai (realm `filter-labs-web`, public client `web-app`).
-- Scout search API at scout.ubiquity.filterlabs.ai/api/v1/search — takes
-  topics (+ optional keywords), returns curated news/social/report results.
+- Scout search API at scout.ubiquity.filterlabs.ai/api/v1/search — takes a
+  single free-form `query` string, returns curated news/social/report
+  results.
 
 Everything needed (auth + search) is bundled in this skill's scripts/
 directory and works on any machine — no hardcoded paths. Requires only a
@@ -46,28 +47,51 @@ CLI:
 
 ## Scout search
 Request: POST https://scout.ubiquity.filterlabs.ai/api/v1/search
-  Headers: Authorization: Bearer <access_token>, Content-Type: application/json
-  Body: {"max_results": <int, required>, "topics": ["..."], "keywords": ["..."] (optional)}
+  Headers: Authorization: Bearer *** Content-Type: application/json
+  Body: {"query": "<free-form text, required>"}
 
-Response: {request_id, content (raw LLM narration), results:
-[{title,url,source,language,published_at,snippet}, ...], queries_used
-(internal expanded queries Scout actually ran), usage}
+As of the 2026 API revision, the request body has ONLY one field:
+`query`, a free-form natural-language string. There is no more
+separate topics/keywords/max_results structure — fold everything into
+the text: subject/topic, which networks or sources to search (news,
+Reddit, Twitter/X, etc.), how many results you want back, recency
+window, language, etc. Scout parses all of that out of the query text
+itself. Example query: "Find the 10 most recent Reddit and Twitter/X
+reactions to the latest Fed interest rate decision, English only."
 
-### Foreground (small requests, max_results <~30)
-  python3 scripts/scout_search.py --topics "topic one" "topic two" \
-      --keywords kw1 kw2 --max-results 10
-  python3 scripts/scout_search.py --topics "topic" --max-results 10 --json   # raw JSON
+The API is now ASYNC: POST /search returns immediately with
+{request_id, status: "queued", poll_url, wait_hint_seconds, ...} — it
+does NOT block until results are ready. The client must GET
+https://scout.ubiquity.filterlabs.ai<poll_url> (same Bearer auth)
+repeatedly until status becomes "done" (or "error"). scout_search() in
+scripts/scout_search.py handles this polling loop internally, so
+callers still just get back a finished dict — but be aware the
+underlying exchange is POST + repeated GET, not one blocking POST, if
+you ever call the raw HTTP API directly.
 
-Timeout auto-scales with max_results (min 600s, +5s per requested
-result) — no need to pass --timeout manually unless overriding. Even a
-small request (e.g. max_results=30) has taken ~9 minutes end-to-end in
-practice, so the floor is intentionally generous.
+Final response once status is "done": {request_id, status, content
+(raw LLM narration), results: [{title,url,source,language,
+published_at,snippet}, ...], queries_used (internal expanded queries
+Scout actually ran), usage}
 
-### Background (long-running requests — USE THIS for max_results >= 50,
-or whenever you'd otherwise block a shell/terminal call waiting)
+### Foreground (small requests, asking for <~30 results)
+  python3 scripts/scout_search.py --query "Find 10 recent articles about topic X and topic Y"
+  python3 scripts/scout_search.py --query "..." --json   # raw JSON
+
+The overall poll timeout (how long the client will keep polling
+poll_url before giving up) auto-scales with --results-hint (min 600s,
++5s per hinted result; default 10). --results-hint is LOCAL ONLY
+(never sent to the API) — pass roughly the same count you put in the
+query text so the timeout is realistic, e.g. --results-hint 30. Even a
+small request has taken ~9 minutes end-to-end in practice (submit +
+poll until status: done), so the floor is intentionally generous.
+
+### Background (long-running requests — USE THIS when the query asks
+for >= 50 results, or whenever you'd otherwise block a shell/terminal
+call waiting)
   # Launch: returns immediately with a PID and files to poll
-  python3 scripts/scout_search.py --topics "topic" --max-results 300 \
-      --out /tmp/scout_run.json --background
+  python3 scripts/scout_search.py --query "Find 300 articles about topic X" \
+      --results-hint 300 --out /tmp/scout_run.json --background
 
   # Poll (repeat until status is done/error; safe to call anytime)
   python3 scripts/scout_search.py --status /tmp/scout_run.json
@@ -82,26 +106,26 @@ blocking a single foreground call on a 5-10+ minute Scout request.
   import sys, os
   sys.path.insert(0, os.path.join(SKILL_DIR, "scripts"))
   from scout_search import scout_search
-  data = scout_search(topics=["AI safety"], keywords=["alignment"], max_results=5)
+  data = scout_search("Find 5 recent articles about AI safety and alignment", results_hint=5)
   for r in data["results"]:
       print(r["title"], r["url"])
-  # timeout=None (default) auto-scales with max_results; pass an int to override.
+  # timeout=None (default) auto-scales with results_hint; pass an int to override.
 
 ## Usage notes
-- topics is required (non-empty list); keywords is optional.
-- Map the user's core subject(s) to topics, narrower filter terms to
-  keywords. Scout expands these into several internal search queries
-  (see `queries_used`) — keep topics/keywords short/conceptual, not full
-  sentences. To bias toward social platforms, say so explicitly in the
-  topic/keywords (e.g. topics=["Reddit and Twitter/X reactions to ..."],
-  keywords=["reddit","twitter","X","tweet"]) — Scout does not default to
-  social sources.
-- max_results is a hint/ceiling, NOT a guarantee. Scout has returned far
-  fewer structured results than requested (e.g. asked for 500, got 56)
-  even on a successful HTTP 200. ALWAYS check len(data["results"]) and
-  report the actual count to the user — never assume you got what you
-  asked for. The CLI prints `requested: X  received: Y` and warns on
-  stderr when received < 50% of requested.
+- query is required (non-empty string) and is the ONLY field sent to the
+  API. Write it as a natural-language request, not keyword fragments —
+  include subject matter, desired result count, source/network bias,
+  recency, and language as plain text in the sentence.
+- To bias toward social platforms, say so explicitly in the query text
+  (e.g. "...search Reddit and Twitter/X reactions to...") — Scout does
+  not default to social sources.
+- Any count mentioned in the query is a hint/ceiling, NOT a guarantee.
+  Scout has returned far fewer structured results than asked for (e.g.
+  asked for 500, got 56) even on a successful HTTP 200. ALWAYS check
+  len(data["results"]) and report the actual count to the user — never
+  assume you got what you asked for. The CLI prints
+  `results_hint: X  received: Y` and warns on stderr when received <
+  50% of the hint.
 - `content` is free-text LLM narration. Normally ignore it and parse
   `results`. EXCEPTION: if `results` comes back empty (seen on
   social/Reddit-heavy queries where Reddit access gets rate-limited
@@ -112,3 +136,13 @@ blocking a single foreground call on a 5-10+ minute Scout request.
   reconstruction from partial data) and mention the caveat to the user.
 - 401 errors usually mean the refresh_token itself expired (>8h idle) —
   re-run --login with fresh credentials.
+- CONCURRENCY WARNING: firing multiple scout_search.py calls back-to-back
+  (e.g. several --background launches in the same second) has been
+  observed to make the API collapse them onto a SINGLE shared job/
+  request_id — all of them then return identical results, silently
+  ignoring the distinct query text of everything but the one job that
+  "won". Symptom: every job's `request_id` in the output files is
+  identical. Fix: stagger background launches by several seconds each
+  (e.g. `sleep 5` between launches), or run them fully sequentially, and
+  afterward verify request_id differs across all output files before
+  trusting the results.

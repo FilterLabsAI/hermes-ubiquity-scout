@@ -136,13 +136,11 @@ blocking a single foreground call on a 5-10+ minute Scout request.
   reconstruction from partial data) and mention the caveat to the user.
 - 401 errors usually mean the refresh_token itself expired (>8h idle) —
   re-run --login with fresh credentials.
-- CONCURRENCY WARNING: firing multiple scout_search.py calls back-to-back
-  (e.g. several --background launches in the same second) has been
-  observed to make the API collapse them onto a SINGLE shared job/
-  request_id — all of them then return identical results, silently
-  ignoring the distinct query text of everything but the one job that
-  "won". Symptom: every job's `request_id` in the output files is
-  identical. Fix: stagger background launches by several seconds each
-  (e.g. `sleep 5` between launches), or run them fully sequentially, and
-  afterward verify request_id differs across all output files before
-  trusting the results.
+- CONCURRENCY: jobs are fully isolated server-side — each
+  concurrent POST /search gets its own distinct request_id and its own
+  results, so firing off several --background launches at once (or
+  calling scout_search() from parallel threads/processes) is safe.
+  No staggering or one-at-a-time sequencing is required. (If you ever
+  see duplicate request_ids across concurrent jobs, that would
+  indicate a regression — treat it as a bug report, not expected
+  behavior.)
